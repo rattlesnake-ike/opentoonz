@@ -22,6 +22,7 @@
 #include <QComboBox>
 #include <QGroupBox>
 #include <QCoreApplication>
+#include <QSet>
 
 using namespace DVGui;
 
@@ -451,63 +452,75 @@ void XDTSImportPopup::updateSuggestions(const TFilePath& path) {
       "*.bmp", "*.jpg", "*.jpeg", "*.nol", "*.pic", "*.pict", "*.pct",
       "*.png", "*.rgb", "*.sgi",  "*.tga", "*.tif", "*.tiff"};
 
-  bool suggestFolderFound = false;
-  QDir suggestFolder(path.getQString());
+  // Level folders are often grouped one or two folders below the xdts file
+  // (FOLDER1/A/A_0001.png). Search that deep, shallowest first, and stop after
+  // a bounded number of folders so an xdts at the top of a large drive does
+  // not trigger a scan of the whole drive.
+  static const int maxDepth   = 3;
+  static const int maxFolders = 256;
 
-  auto assignMatchingFiles = [&](QStringList& files) {
-    auto it = m_fields.begin();
-    while (it != m_fields.end()) {
+  QDir suggestFolder(path.getQString());
+  QSet<QString> assigned;  // levels suggested by this search
+
+  // relativeFiles: paths relative to suggestFolder, all at one depth.
+  // At depth 2 and below a file only matches a level when the folder holding
+  // it is named after the level: deeper paths contain more folder names, and
+  // the loose ".*name.*" match would pick up unrelated folders.
+  auto assignMatchingFiles = [&](QStringList relativeFiles, int depth) {
+    for (auto it = m_fields.begin(); it != m_fields.end(); ++it) {
       const QString levelName = it.key();
       FileField* fileField    = it.value();
 
-      if (fileField->getPath().isEmpty() ||
-          m_pathSuggestedLevels.contains(levelName)) {
-        // Create regex pattern to match level name with any extension
-        const QString filePattern =
-            QString(".*%1.*\\.[a-zA-Z0-9]{3,4}$").arg(levelName);
-        const QRegularExpression regex(filePattern);
+      if (assigned.contains(levelName)) continue;
+      if (!fileField->getPath().isEmpty() &&
+          !m_pathSuggestedLevels.contains(levelName))
+        continue;
 
-        const int index = files.indexOf(regex);
-        if (index != -1) {
-          suggestFolderFound = true;
-          const TFilePath foundPath(suggestFolder.filePath(files[index]));
-          const TFilePath codedPath = m_scene->codeFilePath(foundPath);
+      const QRegularExpression regex(
+          QString(".*%1.*\\.[a-zA-Z0-9]{3,4}$")
+              .arg(QRegularExpression::escape(levelName)));
 
-          fileField->setPath(codedPath.getQString());
-          files.removeAt(index);
+      for (int i = 0; i < relativeFiles.size(); ++i) {
+        const QString& file = relativeFiles[i];
+        if (!regex.match(file).hasMatch()) continue;
+        if (depth >= 2 &&
+            file.section('/', -2, -2).compare(levelName, Qt::CaseInsensitive) !=
+                0)
+          continue;
+
+        const TFilePath foundPath(suggestFolder.filePath(file));
+        fileField->setPath(m_scene->codeFilePath(foundPath).getQString());
+        if (!m_pathSuggestedLevels.contains(levelName))
           m_pathSuggestedLevels.append(levelName);
-        }
+        assigned.insert(levelName);
+        relativeFiles.removeAt(i);
+        break;
       }
-      ++it;
     }
   };
 
-  // Search in relative paths
-  QStringList relativePaths = suggestFolder.entryList(
-      filters, QDir::Files | QDir::Readable | QDir::NoDotAndDotDot);
+  // Breadth first: the files of every folder at one depth, then the next.
+  QStringList folders = {QString()};  // relative to suggestFolder
+  int visited         = 0;
+  for (int depth = 0; depth <= maxDepth && !folders.isEmpty(); ++depth) {
+    QStringList files, next;
+    for (const QString& rel : folders) {
+      if (++visited > maxFolders) break;
+      QDir dir = suggestFolder;
+      if (!rel.isEmpty() && !dir.cd(rel)) continue;
 
-  assignMatchingFiles(relativePaths);
-
-  if (!suggestFolderFound) {
-    relativePaths.clear();
-
-    // Search in subdirectories
-    const QStringList subDirs = suggestFolder.entryList(
-        QDir::Dirs | QDir::Readable | QDir::NoDotAndDotDot);
-
-    for (const QString& subDirName : subDirs) {
-      QDir subDir = suggestFolder;
-      if (!subDir.cd(subDirName)) continue;
-
-      const QStringList filesInSubDir = subDir.entryList(
-          filters, QDir::Files | QDir::Readable | QDir::NoDotAndDotDot);
-
-      for (const QString& file : filesInSubDir) {
-        relativePaths.append(subDirName + "/" + file);
-      }
+      const QString prefix = rel.isEmpty() ? QString() : rel + "/";
+      for (const QString& f : dir.entryList(
+               filters, QDir::Files | QDir::Readable | QDir::NoDotAndDotDot))
+        files.append(prefix + f);
+      if (depth < maxDepth)
+        for (const QString& d :
+             dir.entryList(QDir::Dirs | QDir::Readable | QDir::NoDotAndDotDot))
+          next.append(prefix + d);
     }
-
-    assignMatchingFiles(relativePaths);
+    assignMatchingFiles(files, depth);
+    if (assigned.size() == m_fields.size()) break;
+    folders = next;
   }
 }
 
